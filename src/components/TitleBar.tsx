@@ -22,6 +22,7 @@ interface TitleBarProps {
   trackingEnabled: boolean;
   onToggleTracking: (enabled: boolean) => void;
   status?: SystemStatus;
+  yieldedAppName?: string | null;
   fps?: number;
 }
 
@@ -29,6 +30,7 @@ export function TitleBar({
   trackingEnabled,
   onToggleTracking,
   status = "active",
+  yieldedAppName = null,
   fps = 15,
 }: TitleBarProps) {
   const [isMaximized, setIsMaximized] = useState(false);
@@ -72,9 +74,13 @@ export function TitleBar({
     switch (status) {
       case "yielded":
         return (
-          <Badge variant="warning" className="gap-1.5 text-[11px] py-0 px-2 font-medium">
+          <Badge
+            variant="warning"
+            className="gap-1.5 text-[11px] py-0 px-2 font-medium"
+            title={yieldedAppName ? `Webcam surrendered to ${yieldedAppName}` : "Webcam surrendered to video call"}
+          >
             <VideoOff className="h-3 w-3 text-amber-400" />
-            <span>Yielded to Video Call</span>
+            <span>Yielded{yieldedAppName ? `: ${yieldedAppName}` : " to Video Call"}</span>
           </Badge>
         );
       case "gaming_paused":

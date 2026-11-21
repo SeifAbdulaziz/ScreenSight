@@ -1,5 +1,9 @@
+pub mod camera_guard;
 pub mod win32_focus;
 
+use camera_guard::{
+    list_available_cameras, CameraActorHandle, CameraDeviceInfo, CameraStatus, SharedCameraState,
+};
 use tauri::Manager;
 use win32_focus::{SystemMonitor, TopWindowInfo};
 
@@ -58,6 +62,41 @@ fn check_fullscreen_state() -> bool {
     win32_focus::is_fullscreen_game_active()
 }
 
+// ==============================================================================
+// Phase 3: Webcam Enumeration & Auto-Yield Guard IPC Commands
+// ==============================================================================
+
+/// Queries connected physical webcams via Microsoft Media Foundation.
+#[tauri::command]
+fn list_cameras() -> Result<Vec<CameraDeviceInfo>, String> {
+    list_available_cameras()
+}
+
+/// Polls current camera status, actively verifying ConsentStore conflict state.
+#[tauri::command]
+fn get_camera_status(
+    state: tauri::State<'_, SharedCameraState>,
+) -> CameraStatus {
+    state.0.get_status()
+}
+
+/// Updates camera index, target FPS, or auto-yield toggle from the dashboard UI.
+#[tauri::command]
+fn set_camera_config(
+    camera_index: u32,
+    target_fps: u32,
+    auto_yield: bool,
+    state: tauri::State<'_, SharedCameraState>,
+) -> CameraStatus {
+    state.0.update_config(camera_index, target_fps, auto_yield)
+}
+
+/// Directly queries the Windows ConsentStore registry for any other app using the camera.
+#[tauri::command]
+fn check_camera_conflict() -> Option<String> {
+    camera_guard::get_other_active_camera_user()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -73,6 +112,11 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_opener::init())
+        .manage(SharedCameraState(CameraActorHandle::new(
+            0,    // Default camera index
+            15,   // Default 15 FPS
+            true, // Auto-yield enabled by default
+        )))
         .invoke_handler(tauri::generate_handler![
             minimize_window,
             toggle_maximize_window,
@@ -80,6 +124,10 @@ pub fn run() {
             get_system_monitors,
             debug_focus_monitor,
             check_fullscreen_state,
+            list_cameras,
+            get_camera_status,
+            set_camera_config,
+            check_camera_conflict,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ScreenSight Tauri application");
