@@ -3080,6 +3080,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
+ "windows",
 ]
 
 [[package]]

@@ -40,9 +40,9 @@ export default function App() {
 
       {/* 2. Bento Grid Dashboard Canvas */}
       <main className="flex-1 p-3 grid grid-cols-1 md:grid-cols-2 gap-3 overflow-hidden">
-        {/* Top-Left: Active Displays (Phase 1 2D Spatial Engine & Canvas) */}
+        {/* Top-Left: Active Displays (Phase 1 & 2 Spatial + Win32 Focus) */}
         <div className="h-full">
-          <ActiveDisplaysCard />
+          <ActiveDisplaysCard cursorTeleport={cursorTeleport} />
         </div>
 
         {/* Top-Right: Tracking Settings Preview */}

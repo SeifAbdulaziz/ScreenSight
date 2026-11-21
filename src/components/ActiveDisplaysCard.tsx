@@ -1,4 +1,5 @@
-import React, { useState, useRef, useEffect, useMemo } from "react";
+import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import {
   Monitor,
   Move,
@@ -7,6 +8,7 @@ import {
   CheckCircle2,
   AlertCircle,
   Sliders,
+  Laptop,
 } from "lucide-react";
 import {
   Card,
@@ -191,12 +193,35 @@ interface DragState {
   currentDeskPos: DeskPosition;
 }
 
-export function ActiveDisplaysCard() {
-  const [selectedTopologyKey, setSelectedTopologyKey] = useState<string>("three_stacked_1_over_2");
+interface RawSystemMonitor {
+  id: string;
+  display_index: number;
+  is_primary: boolean;
+  os_rect: {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+  };
+}
+
+interface TopWindowResult {
+  title: string;
+  hwnd: number;
+}
+
+interface ActiveDisplaysCardProps {
+  cursorTeleport?: boolean;
+}
+
+export function ActiveDisplaysCard({ cursorTeleport = false }: ActiveDisplaysCardProps) {
+  const [selectedTopologyKey, setSelectedTopologyKey] = useState<string>("live_system");
   const [monitors, setMonitors] = useState<MonitorInfo[]>(MOCK_TOPOLOGIES["three_stacked_1_over_2"].monitors);
   const [isArrangeMode, setIsArrangeMode] = useState(false);
   const [showIdentityBadges, setShowIdentityBadges] = useState(false);
   const [dragState, setDragState] = useState<DragState | null>(null);
+  const [topAppTitle, setTopAppTitle] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const [canvasDimensions, setCanvasDimensions] = useState({ width: 440, height: 210 });
@@ -216,10 +241,52 @@ export function ActiveDisplaysCard() {
     return () => observer.disconnect();
   }, []);
 
+  // Fetch real system monitors from Rust Win32 backend
+  const fetchLiveSystemMonitors = useCallback(async () => {
+    try {
+      const raw = await invoke<RawSystemMonitor[]>("get_system_monitors");
+      if (raw && raw.length > 0) {
+        const mapped: MonitorInfo[] = raw.map((m, idx) => ({
+          id: m.id,
+          name: `${m.is_primary ? "Primary Display" : `Display ${m.display_index}`} (${m.id})`,
+          displayIndex: m.display_index,
+          isPrimary: m.is_primary,
+          enabled: true,
+          calibrated: true,
+          currentFocus: idx === 0,
+          osRect: m.os_rect,
+          deskPos: {
+            x: m.os_rect.left,
+            y: m.os_rect.top,
+            width: m.os_rect.right - m.os_rect.left,
+            height: m.os_rect.bottom - m.os_rect.top,
+          },
+        }));
+        setMonitors(mapped);
+        setSelectedTopologyKey("live_system");
+        setStatusMessage(`Loaded ${raw.length} active Windows display(s).`);
+        setTimeout(() => setStatusMessage(null), 3000);
+      }
+    } catch {
+      // Fallback to mock preset when outside Tauri runtime
+      setSelectedTopologyKey("three_stacked_1_over_2");
+      setMonitors(MOCK_TOPOLOGIES["three_stacked_1_over_2"].monitors);
+    }
+  }, []);
+
+  // Automatically load live system displays on startup
+  useEffect(() => {
+    fetchLiveSystemMonitors();
+  }, [fetchLiveSystemMonitors]);
+
   // When topology selector changes, update monitor list
   const handleSelectTopology = (key: string) => {
     setSelectedTopologyKey(key);
-    setMonitors(MOCK_TOPOLOGIES[key].monitors);
+    if (key === "live_system") {
+      fetchLiveSystemMonitors();
+    } else {
+      setMonitors(MOCK_TOPOLOGIES[key].monitors);
+    }
     setDragState(null);
   };
 
@@ -236,6 +303,8 @@ export function ActiveDisplaysCard() {
         },
       }))
     );
+    setStatusMessage("Desk layout synchronized with Windows coordinates.");
+    setTimeout(() => setStatusMessage(null), 2500);
   };
 
   // Toggle monitor tracking inclusion
@@ -245,12 +314,34 @@ export function ActiveDisplaysCard() {
     );
   };
 
-  // Toggle mock focus to simulate glance shift
-  const handleSimulateFocus = (id: string) => {
+  // Focus monitor: Invokes Rust Win32 focus command in Phase 2
+  const handleFocusMonitor = async (id: string) => {
     if (isArrangeMode) return;
+
     setMonitors((prev) =>
       prev.map((m) => ({ ...m, currentFocus: m.id === id }))
     );
+
+    try {
+      const res = await invoke<TopWindowResult | null>("debug_focus_monitor", {
+        monitorId: id,
+        teleportCursor: cursorTeleport,
+        excludedProcesses: [],
+      });
+
+      if (res && res.title) {
+        setTopAppTitle(res.title);
+        setStatusMessage(`Focus switched to: "${res.title}"`);
+      } else {
+        setTopAppTitle("Desktop");
+        setStatusMessage("Focus switched to target screen (Desktop).");
+      }
+    } catch (err: unknown) {
+      const msg = typeof err === "string" ? err : "Focus shift failed";
+      setStatusMessage(msg);
+    }
+
+    setTimeout(() => setStatusMessage(null), 3500);
   };
 
   // Flash identity badges
@@ -292,7 +383,6 @@ export function ActiveDisplaysCard() {
 
     setDragState((prev) => (prev ? { ...prev, currentDeskPos: newPos } : null));
 
-    // Update position in state dynamically during drag
     setMonitors((prev) =>
       prev.map((m) => (m.id === dragState.monitorId ? { ...m, deskPos: newPos } : m))
     );
@@ -301,7 +391,6 @@ export function ActiveDisplaysCard() {
   const handlePointerUp = () => {
     if (!dragState || !isArrangeMode) return;
 
-    // Apply magnetic snapping and overlap rejection on release
     const result = snapMonitorPosition(
       dragState.monitorId,
       dragState.currentDeskPos,
@@ -335,13 +424,14 @@ export function ActiveDisplaysCard() {
 
         {/* Toolbar Controls */}
         <div className="flex items-center gap-1.5">
-          {/* Quick Rig Presets for testing */}
+          {/* Quick Rig Presets / Live System selector */}
           <select
             value={selectedTopologyKey}
             onChange={(e) => handleSelectTopology(e.target.value)}
             className="h-7 text-[11px] bg-zinc-950/80 border border-zinc-800 rounded px-2 text-zinc-300 focus:outline-none focus:ring-1 focus:ring-emerald-500 cursor-pointer"
-            title="Switch multi-monitor test setup"
+            title="Switch multi-monitor setup"
           >
+            <option value="live_system">🖥️ Live Windows Displays</option>
             {Object.entries(MOCK_TOPOLOGIES).map(([k, v]) => (
               <option key={k} value={k}>
                 {v.label}
@@ -404,6 +494,14 @@ export function ActiveDisplaysCard() {
           </div>
         )}
 
+        {/* Live Feedback Toast/Banner */}
+        {statusMessage && !isArrangeMode && (
+          <div className="mb-2 py-1 px-2.5 rounded bg-zinc-800/90 border border-emerald-500/30 text-[11px] text-emerald-300 flex items-center gap-1.5 animate-in fade-in duration-150">
+            <Laptop className="h-3 w-3 text-emerald-400 shrink-0" />
+            <span className="truncate">{statusMessage}</span>
+          </div>
+        )}
+
         {/* 2D Interactive Projection Canvas */}
         <div
           ref={containerRef}
@@ -414,7 +512,7 @@ export function ActiveDisplaysCard() {
             isArrangeMode ? "cursor-grab active:cursor-grabbing border-emerald-500/40" : "cursor-default"
           )}
         >
-          {/* Subtle grid background to visualize 2D desk space */}
+          {/* Grid background */}
           <div
             className="absolute inset-0 opacity-[0.04] pointer-events-none"
             style={{
@@ -432,7 +530,7 @@ export function ActiveDisplaysCard() {
                 <div
                   key={m.id}
                   onPointerDown={(e) => handlePointerDown(e, m)}
-                  onClick={() => handleSimulateFocus(m.id)}
+                  onClick={() => handleFocusMonitor(m.id)}
                   style={{
                     transform: `translate(${canvasX}px, ${canvasY}px)`,
                     width: `${canvasWidth}px`,
@@ -441,24 +539,18 @@ export function ActiveDisplaysCard() {
                   }}
                   className={cn(
                     "absolute top-0 left-0 rounded-md transition-shadow flex flex-col justify-between p-2 select-none",
-                    // Focus highlight (Emerald glow)
                     m.currentFocus
                       ? "bg-zinc-900/90 border-2 border-emerald-500 shadow-[0_0_15px_rgba(16,185,129,0.25)]"
                       : "bg-zinc-900/70 border border-zinc-800/90 hover:border-zinc-700",
-                    // Uncalibrated warning dashed border
                     !m.calibrated && "border-dashed border-amber-500/60",
-                    // Disabled style
                     !m.enabled && "opacity-40 grayscale",
-                    // Dragging state
                     isDraggingThis && "opacity-90 ring-2 ring-emerald-400 shadow-2xl scale-[1.02] cursor-grabbing",
-                    // Cursor style
                     isArrangeMode ? "cursor-grab active:cursor-grabbing" : "cursor-pointer"
                   )}
                 >
                   {/* Top Bar inside Monitor Tile */}
                   <div className="flex items-center justify-between w-full pointer-events-none">
                     <div className="flex items-center gap-1.5 overflow-hidden">
-                      {/* Numbered display badge */}
                       <span
                         className={cn(
                           "flex h-4 w-4 shrink-0 items-center justify-center rounded text-[10px] font-bold font-mono",
@@ -477,7 +569,6 @@ export function ActiveDisplaysCard() {
                       )}
                     </div>
 
-                    {/* Calibration status dot */}
                     <div className="flex items-center gap-1">
                       {m.isPrimary && (
                         <span className="text-[9px] uppercase px-1 py-0.2 rounded bg-zinc-800 text-zinc-400 font-mono">
@@ -509,7 +600,7 @@ export function ActiveDisplaysCard() {
                             Desk: ({m.deskPos.x}, {m.deskPos.y}) | Res: {m.deskPos.width}×{m.deskPos.height}
                           </p>
                           <p className="text-emerald-400">
-                            {m.currentFocus ? "Active Focus" : "Click to shift focus"}
+                            {m.currentFocus ? "Active Focus" : "Click to switch OS focus"}
                           </p>
                         </div>
                       </TooltipContent>
@@ -528,7 +619,7 @@ export function ActiveDisplaysCard() {
                     </div>
                   )}
 
-                  {/* Bottom Bar: Action Popover trigger in live mode */}
+                  {/* Bottom Bar: Action Popover */}
                   <div className="flex items-center justify-between w-full pt-1 pointer-events-auto">
                     <span className="text-[9px] font-mono text-zinc-400">
                       ({m.deskPos.x}, {m.deskPos.y})
@@ -608,20 +699,21 @@ export function ActiveDisplaysCard() {
 
         {/* Footer telemetry bar for Focused Monitor */}
         <div className="mt-2.5 pt-2 border-t border-zinc-800/60 flex items-center justify-between text-[11px] text-zinc-400">
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5 truncate max-w-[65%]">
             <span className="text-zinc-400">Focused:</span>
             {focusedMonitor ? (
-              <span className="text-zinc-200 font-medium flex items-center gap-1">
-                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                Monitor {focusedMonitor.displayIndex} ({focusedMonitor.name.split("(")[0].trim()})
+              <span className="text-zinc-200 font-medium flex items-center gap-1 truncate">
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shrink-0" />
+                Monitor {focusedMonitor.displayIndex}
+                {topAppTitle ? ` · "${topAppTitle}"` : ` (${focusedMonitor.name.split("(")[0].trim()})`}
               </span>
             ) : (
               <span className="text-zinc-400 italic">None</span>
             )}
           </div>
 
-          <div className="flex items-center gap-2 font-mono text-[10px] text-zinc-400">
-            <span>Projection Scale: {layout.scale.toFixed(4)}x</span>
+          <div className="flex items-center gap-2 font-mono text-[10px] text-zinc-400 shrink-0">
+            <span>Scale: {layout.scale.toFixed(4)}x</span>
           </div>
         </div>
       </CardContent>

@@ -1,4 +1,7 @@
+pub mod win32_focus;
+
 use tauri::Manager;
+use win32_focus::{SystemMonitor, TopWindowInfo};
 
 // ==============================================================================
 // Frameless Window Control Commands
@@ -24,8 +27,35 @@ fn toggle_maximize_window(window: tauri::Window) {
 
 #[tauri::command]
 fn close_window(window: tauri::Window) {
-    // In later phases, close will hide to system tray. For Phase 1, we close/hide gracefully.
     let _ = window.close();
+}
+
+// ==============================================================================
+// Phase 2: Win32 Multi-Monitor & Focus IPC Commands
+// ==============================================================================
+
+/// Queries real Windows display topology and virtual desktop coordinates (osRect).
+#[tauri::command]
+fn get_system_monitors() -> Vec<SystemMonitor> {
+    win32_focus::get_system_monitors()
+}
+
+/// Shifts OS keyboard and window focus to the top visible application on the target monitor.
+/// Bypasses the Windows foreground lock via input queue attachment and respects gaming auto-pause.
+#[tauri::command]
+fn debug_focus_monitor(
+    monitor_id: String,
+    teleport_cursor: bool,
+    excluded_processes: Option<Vec<String>>,
+) -> Result<Option<TopWindowInfo>, String> {
+    let exclusions = excluded_processes.unwrap_or_default();
+    win32_focus::switch_focus_to_monitor(&monitor_id, teleport_cursor, &exclusions)
+}
+
+/// Checks whether an exclusive DirectX/Direct3D fullscreen game is currently active.
+#[tauri::command]
+fn check_fullscreen_state() -> bool {
+    win32_focus::is_fullscreen_game_active()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -37,7 +67,6 @@ pub fn run() {
         // refocusing the primary instance instead of opening duplicate hooks.
         // ----------------------------------------------------------------------
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            // When a secondary instance launches, bring the main window to front.
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
@@ -47,7 +76,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             minimize_window,
             toggle_maximize_window,
-            close_window
+            close_window,
+            get_system_monitors,
+            debug_focus_monitor,
+            check_fullscreen_state,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ScreenSight Tauri application");
