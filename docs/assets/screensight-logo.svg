@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" fill="none">
+  <defs>
+    <linearGradient id="ss-bg" x1="48" y1="32" x2="464" y2="480" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#14191f" />
+      <stop offset="100%" stop-color="#09090b" />
+    </linearGradient>
+    <radialGradient id="ss-glow" cx="50%" cy="48%" r="52%">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.22" />
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+
+  <!-- Rounded dark surface matching TitleBar badge (bg-zinc-950 + emerald-500 border) -->
+  <rect x="24" y="24" width="464" height="464" rx="112" fill="url(#ss-bg)" />
+  <rect x="24" y="24" width="464" height="464" rx="112" fill="url(#ss-glow)" />
+  <rect
+    x="31"
+    y="31"
+    width="450"
+    height="450"
+    rx="105"
+    stroke="#10b981"
+    stroke-opacity="0.55"
+    stroke-width="14"
+  />
+
+  <!-- Exact Lucide Eye silhouette centered at (256, 256): 256 - 12 * 14.6 = 80.8 -->
+  <g
+    transform="translate(80.8 80.8) scale(14.6)"
+    stroke="#34d399"
+    stroke-width="2.15"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <path
+      d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"
+      fill="#10b981"
+      fill-opacity="0.16"
+    />
+    <circle cx="12" cy="12" r="3.1" fill="#10b981" fill-opacity="0.24" />
+  </g>
+</svg>

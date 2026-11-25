@@ -1,5 +1,10 @@
 # ScreenSight
 
+[![Website / Docs](https://img.shields.io/badge/Website%20%2F%20Docs-seifabdulaziz.github.io%2FScreenSight-10b981?style=flat-square)](https://seifabdulaziz.github.io/ScreenSight/)
+[![Latest Release](https://img.shields.io/github/v/release/SeifAbdulaziz/ScreenSight?label=Latest%20Release&color=18181b&style=flat-square)](https://github.com/SeifAbdulaziz/ScreenSight/releases/latest)
+
+**Website & Downloads:** [seifabdulaziz.github.io/ScreenSight](https://seifabdulaziz.github.io/ScreenSight/) · [Latest Windows Installer](https://github.com/SeifAbdulaziz/ScreenSight/releases/latest)
+
 **ScreenSight** is a local, privacy-first Windows utility that lives in the System Tray and automatically shifts OS window and keyboard focus to whichever display you are looking at—across 2-, 3-, or $N$-monitor horizontal, portrait, ultrawide, and vertically stacked ($2 \times 2$ / $1$-over-$2$) setups.
 
 > Built with **Rust**, **Tauri 2**, **Win32 API (`windows`)**, **Media Foundation (`nokhwa`)**, **ONNX Runtime (`ort`)**, **React**, **TypeScript**, **Tailwind CSS v4**, and **shadcn/ui**.
