@@ -1582,9 +1582,22 @@ input[type="range"] {
   color: var(--emerald-bright);
 }
 
+.footer-credit {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
+
 .footer-credit a {
   color: var(--text);
   font-weight: 500;
+}
+
+.footer-social-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
 }
 
 /* Responsive Breakpoints */
