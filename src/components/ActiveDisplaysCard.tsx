@@ -212,9 +212,15 @@ interface TopWindowResult {
 
 interface ActiveDisplaysCardProps {
   cursorTeleport?: boolean;
+  focusedMonitorId?: string | null;
+  onMonitorsChange?: (monitors: MonitorInfo[]) => void;
 }
 
-export function ActiveDisplaysCard({ cursorTeleport = false }: ActiveDisplaysCardProps) {
+export function ActiveDisplaysCard({
+  cursorTeleport = false,
+  focusedMonitorId = null,
+  onMonitorsChange,
+}: ActiveDisplaysCardProps) {
   const [selectedTopologyKey, setSelectedTopologyKey] = useState<string>("live_system");
   const [monitors, setMonitors] = useState<MonitorInfo[]>(MOCK_TOPOLOGIES["three_stacked_1_over_2"].monitors);
   const [isArrangeMode, setIsArrangeMode] = useState(false);
@@ -278,6 +284,23 @@ export function ActiveDisplaysCard({ cursorTeleport = false }: ActiveDisplaysCar
   useEffect(() => {
     fetchLiveSystemMonitors();
   }, [fetchLiveSystemMonitors]);
+
+  // Reflect live vision-worker focus switches on the monitor canvas
+  useEffect(() => {
+    if (!focusedMonitorId) return;
+    setMonitors((prev) =>
+      prev.some((m) => m.id === focusedMonitorId && !m.currentFocus)
+        ? prev.map((m) => ({ ...m, currentFocus: m.id === focusedMonitorId }))
+        : prev
+    );
+  }, [focusedMonitorId]);
+
+  // Notify parent when topology/deskPos/enabled changes (skip intermediate drag frames)
+  useEffect(() => {
+    if (!dragState) {
+      onMonitorsChange?.(monitors);
+    }
+  }, [monitors, dragState, onMonitorsChange]);
 
   // When topology selector changes, update monitor list
   const handleSelectTopology = (key: string) => {

@@ -24,6 +24,7 @@ interface TitleBarProps {
   status?: SystemStatus;
   yieldedAppName?: string | null;
   fps?: number;
+  measuredFps?: number;
 }
 
 export function TitleBar({
@@ -32,6 +33,7 @@ export function TitleBar({
   status = "active",
   yieldedAppName = null,
   fps = 15,
+  measuredFps = 0,
 }: TitleBarProps) {
   const [isMaximized, setIsMaximized] = useState(false);
 
@@ -126,7 +128,9 @@ export function TitleBar({
           className="gap-1 text-[11px] py-0 px-2 text-zinc-400 border-zinc-800 bg-zinc-900/40"
         >
           <Cpu className="h-3 w-3 text-zinc-500" />
-          <span>{fps} FPS · CPU</span>
+          <span>
+            {measuredFps > 0.5 ? `${Math.round(measuredFps)} / ${fps}` : fps} FPS · CPU
+          </span>
         </Badge>
 
         {/* Local Privacy Guarantee */}

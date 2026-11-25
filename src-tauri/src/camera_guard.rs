@@ -11,11 +11,11 @@ use nokhwa::utils::{
     ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat,
     RequestedFormatType, Resolution,
 };
-use nokhwa::Camera;
+use nokhwa::{Buffer, Camera};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use windows_registry::CURRENT_USER;
@@ -145,7 +145,10 @@ fn clean_app_name(raw_name: &str, is_non_packaged: bool) -> String {
                 return "Google Meet / Chrome".to_string();
             } else if exe.eq_ignore_ascii_case("zoom.exe") {
                 return "Zoom Video Call".to_string();
-            } else if exe.eq_ignore_ascii_case("teams.exe") || exe.eq_ignore_ascii_case("ms-teams.exe") {
+            } else if exe.eq_ignore_ascii_case("teams.exe")
+                || exe.eq_ignore_ascii_case("ms-teams.exe")
+                || exe.eq_ignore_ascii_case("msteams.exe")
+            {
                 return "Microsoft Teams".to_string();
             } else if exe.eq_ignore_ascii_case("discord.exe") {
                 return "Discord Call".to_string();
@@ -225,6 +228,7 @@ enum CameraActorMsg {
         target_fps: u32,
         auto_yield: bool,
     },
+    SetTrackingEnabled(bool),
 }
 
 /// Thread-safe handle for communicating with the dedicated Camera Actor.
@@ -235,16 +239,27 @@ enum CameraActorMsg {
 ///
 /// To solve this safely without unsafe transmutes:
 /// We spawn a dedicated OS thread that OWNS the camera handle exclusively.
-/// Tauri commands communicate via standard message-passing channels (`Sender<CameraActorMsg>`)
-/// and read shared telemetry from an `Arc<Mutex<CameraStatus>>`.
+/// Tauri commands communicate via standard message-passing channels (`Sender<CameraActorMsg>`),
+/// read telemetry from `Arc<Mutex<CameraStatus>>`, and pass undecoded `nokhwa::Buffer`s
+/// (which ARE `Send`) to `vision_worker.rs` through a single-slot `Condvar` mailbox.
 #[derive(Clone)]
 pub struct CameraActorHandle {
     sender: Sender<CameraActorMsg>,
     status: Arc<Mutex<CameraStatus>>,
+    latest_frame: Arc<(Mutex<Option<Buffer>>, Condvar)>,
 }
 
 impl CameraActorHandle {
     pub fn new(initial_index: u32, initial_fps: u32, initial_auto_yield: bool) -> Self {
+        Self::new_with_tracking(initial_index, initial_fps, initial_auto_yield, true)
+    }
+
+    pub fn new_with_tracking(
+        initial_index: u32,
+        initial_fps: u32,
+        initial_auto_yield: bool,
+        initial_tracking: bool,
+    ) -> Self {
         let (tx, rx) = channel::<CameraActorMsg>();
         let status = Arc::new(Mutex::new(CameraStatus {
             is_streaming: false,
@@ -255,20 +270,31 @@ impl CameraActorHandle {
             is_yielded: false,
             yielded_to_app: None,
         }));
+        let latest_frame = Arc::new((Mutex::new(None), Condvar::new()));
 
         let thread_status = Arc::clone(&status);
+        let thread_frame = Arc::clone(&latest_frame);
 
         // Spawn dedicated Camera Actor thread
         thread::Builder::new()
             .name("screensight-camera-actor".to_string())
             .spawn(move || {
-                run_camera_actor(rx, thread_status, initial_index, initial_fps, initial_auto_yield);
+                run_camera_actor(
+                    rx,
+                    thread_status,
+                    thread_frame,
+                    initial_index,
+                    initial_fps,
+                    initial_auto_yield,
+                    initial_tracking,
+                );
             })
             .expect("Failed to spawn camera actor thread");
 
         Self {
             sender: tx,
             status,
+            latest_frame,
         }
     }
 
@@ -290,19 +316,46 @@ impl CameraActorHandle {
         st.auto_yield = auto_yield;
         st.clone()
     }
+
+    /// Immediately pauses or resumes hardware capture.
+    /// When paused (`false`), the camera actor drops `Option<Camera>` to turn off the webcam LED.
+    pub fn set_tracking_enabled(&self, enabled: bool) {
+        let _ = self.sender.send(CameraActorMsg::SetTrackingEnabled(enabled));
+        if !enabled {
+            // Clear any stale buffered frame while paused
+            if let Ok(mut slot) = self.latest_frame.0.lock() {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Blocks up to `timeout` for the newest undecoded camera buffer, dropping older frames.
+    /// Zero-copy handoff: `vision_worker` decodes MJPEG -> RGB only for frames it actually evaluates.
+    pub fn wait_for_frame(&self, timeout: Duration) -> Option<Buffer> {
+        let (lock, cvar) = &*self.latest_frame;
+        let mut slot = lock.lock().ok()?;
+        if slot.is_none() {
+            let (guard, _) = cvar.wait_timeout(slot, timeout).ok()?;
+            slot = guard;
+        }
+        slot.take()
+    }
 }
 
 fn run_camera_actor(
     rx: Receiver<CameraActorMsg>,
     status: Arc<Mutex<CameraStatus>>,
+    latest_frame: Arc<(Mutex<Option<Buffer>>, Condvar)>,
     mut camera_index: u32,
     mut target_fps: u32,
     mut auto_yield: bool,
+    mut tracking_enabled: bool,
 ) {
     let mut active_camera: Option<Camera> = None;
     let mut is_yielded = false;
     let mut yielded_to_app: Option<String> = None;
     let mut last_conflict_check = Instant::now();
+    let mut next_open_retry = Instant::now();
 
     loop {
         // 1. Process pending configuration changes from Tauri IPC
@@ -321,6 +374,16 @@ fn run_camera_actor(
                     if needs_reopen {
                         // Drop existing camera handle immediately to allow reopening
                         active_camera.take();
+                        next_open_retry = Instant::now();
+                    }
+                }
+                CameraActorMsg::SetTrackingEnabled(enabled) => {
+                    tracking_enabled = enabled;
+                    if !tracking_enabled {
+                        // Release webcam immediately on manual pause (privacy + LED off)
+                        active_camera.take();
+                    } else {
+                        next_open_retry = Instant::now();
                     }
                 }
             }
@@ -345,29 +408,61 @@ fn run_camera_actor(
                     // Call ended: Reclaim the camera handle!
                     is_yielded = false;
                     yielded_to_app = None;
+                    next_open_retry = Instant::now();
                 }
+            } else if is_yielded && yielded_to_app.is_some() {
+                is_yielded = false;
+                yielded_to_app = None;
             }
         }
 
-        // 3. Acquire camera stream if not yielded and not currently opened
-        if !is_yielded && active_camera.is_none() {
+        // 3. Acquire camera stream if tracking is active, not yielded, and past retry backoff
+        if tracking_enabled
+            && !is_yielded
+            && active_camera.is_none()
+            && Instant::now() >= next_open_retry
+        {
             match open_camera_stream(camera_index, target_fps) {
                 Ok(cam) => {
                     active_camera = Some(cam);
                     yielded_to_app = None;
                 }
                 Err(err) => {
-                    // Camera might still be briefly held by closing call
-                    is_yielded = true;
+                    // Bounded 2-second backoff avoids spinning Media Foundation when unplugged
+                    next_open_retry = Instant::now() + Duration::from_secs(2);
                     yielded_to_app = Some(format!("Device busy ({})", err));
                 }
             }
         }
 
-        // 4. Publish latest telemetry to thread-safe container
+        // 4. Drain latest hardware sample so Media Foundation never buffers stale frames
+        if tracking_enabled && !is_yielded {
+            if let Some(ref mut cam) = active_camera {
+                match cam.frame() {
+                    Ok(buffer) => {
+                        let (lock, cvar) = &*latest_frame;
+                        if let Ok(mut slot) = lock.lock() {
+                            *slot = Some(buffer);
+                            cvar.notify_one();
+                        }
+                    }
+                    Err(_) => {
+                        // Stream interrupted (unplugged or claimed externally): release & backoff
+                        active_camera.take();
+                        next_open_retry = Instant::now() + Duration::from_secs(2);
+                    }
+                }
+            } else {
+                thread::sleep(Duration::from_millis(50));
+            }
+        } else {
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        // 5. Publish latest telemetry to thread-safe container
         {
             if let Ok(mut st) = status.lock() {
-                st.is_streaming = active_camera.is_some() && !is_yielded;
+                st.is_streaming = active_camera.is_some() && !is_yielded && tracking_enabled;
                 st.camera_index = camera_index;
                 st.target_fps = target_fps;
                 st.auto_yield = auto_yield;
@@ -375,9 +470,6 @@ fn run_camera_actor(
                 st.yielded_to_app = yielded_to_app.clone();
             }
         }
-
-        // Sleep throttled loop (50ms when idle/streaming)
-        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -400,6 +492,9 @@ mod tests {
         let zoom_path = r"C:#Users#User#AppData#Roaming#Zoom#bin#zoom.exe";
         assert_eq!(clean_app_name(zoom_path, true), "Zoom Video Call");
 
+        let teams_path = r"C:#Program Files#WindowsApps#MSTeams#msteams.exe";
+        assert_eq!(clean_app_name(teams_path, true), "Microsoft Teams");
+
         let obs_path = r"C:#Program Files#obs-studio#bin#64bit#obs64.exe";
         assert_eq!(clean_app_name(obs_path, true), "OBS Studio");
 
@@ -415,10 +510,12 @@ mod tests {
 
     #[test]
     fn test_camera_actor_handle_creation() {
-        let handle = CameraActorHandle::new(0, 15, true);
+        // Start paused in unit test so CI/dev tests never blink the physical webcam LED
+        let handle = CameraActorHandle::new_with_tracking(0, 15, true, false);
         let st = handle.get_status();
         assert_eq!(st.target_fps, 15);
         assert_eq!(st.camera_index, 0);
         assert!(st.auto_yield);
+        assert!(!st.is_streaming);
     }
 }

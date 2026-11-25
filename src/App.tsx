@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { TitleBar, SystemStatus } from "@/components/TitleBar";
 import { ActiveDisplaysCard } from "@/components/ActiveDisplaysCard";
+import { MonitorInfo } from "@/lib/monitorLayout";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Slider } from "@/components/ui/slider";
@@ -33,6 +34,24 @@ interface CameraStatus {
   yielded_to_app: string | null;
 }
 
+interface VisionTelemetry {
+  running: boolean;
+  face_detected: boolean;
+  face_confidence: number;
+  raw_yaw: number;
+  raw_pitch: number;
+  smoothed_yaw: number;
+  smoothed_pitch: number;
+  smoothed_roll: number;
+  measured_fps: number;
+  is_2d_layout: boolean;
+  focused_monitor_id: string | null;
+  pending_monitor_id: string | null;
+  pending_progress: number;
+  monitor_distances: [string, number][];
+  last_error: string | null;
+}
+
 export default function App() {
   const [trackingEnabled, setTrackingEnabled] = useState(true);
   const [systemStatus, setSystemStatus] = useState<SystemStatus>("active");
@@ -42,14 +61,34 @@ export default function App() {
   const [cameras, setCameras] = useState<CameraDeviceInfo[]>([]);
   const [selectedCameraIndex, setSelectedCameraIndex] = useState<number>(0);
   const [fps, setFps] = useState<number>(15);
+  const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
 
-  // Settings mock & real state
+  // Settings & Safeguards
   const [switchMargin, setSwitchMargin] = useState(6);
   const [dwellDelay, setDwellDelay] = useState(300);
   const [autoYield, setAutoYield] = useState(true);
   const [gamingPause, setGamingPause] = useState(true);
   const [batteryEco, setBatteryEco] = useState(true);
   const [cursorTeleport, setCursorTeleport] = useState(false);
+
+  // Live Vision Telemetry (Phase 4)
+  const [telemetry, setTelemetry] = useState<VisionTelemetry>({
+    running: false,
+    face_detected: false,
+    face_confidence: 0,
+    raw_yaw: 0,
+    raw_pitch: 0,
+    smoothed_yaw: 0,
+    smoothed_pitch: 0,
+    smoothed_roll: 0,
+    measured_fps: 0,
+    is_2d_layout: false,
+    focused_monitor_id: null,
+    pending_monitor_id: null,
+    pending_progress: 0,
+    monitor_distances: [],
+    last_error: null,
+  });
 
   // 1. Enumerate physical webcams on mount
   useEffect(() => {
@@ -61,7 +100,6 @@ export default function App() {
           setSelectedCameraIndex(list[0].index);
         }
       } catch {
-        // Fallback for browser dev mode
         setCameras([
           {
             index: 0,
@@ -74,7 +112,7 @@ export default function App() {
     loadCameras();
   }, []);
 
-  // 2. Synchronize configuration with Rust Camera Actor
+  // 2. Synchronize camera configuration with Rust Camera Actor + Vision Worker
   const syncCameraConfig = useCallback(
     async (newCamIdx: number, newFps: number, newYield: boolean) => {
       try {
@@ -100,6 +138,15 @@ export default function App() {
     [trackingEnabled]
   );
 
+  const handleToggleTracking = async (enabled: boolean) => {
+    setTrackingEnabled(enabled);
+    try {
+      await invoke("set_tracking_enabled", { enabled });
+    } catch {
+      // Dev fallback
+    }
+  };
+
   const handleCameraChange = (newIndex: number) => {
     setSelectedCameraIndex(newIndex);
     syncCameraConfig(newIndex, fps, autoYield);
@@ -115,7 +162,38 @@ export default function App() {
     syncCameraConfig(selectedCameraIndex, fps, enabled);
   };
 
-  // 3. Periodic polling loop for Auto-Yield (Registry ConsentStore) & Fullscreen gaming
+  // 3. Push vision tuning & 2D monitor layout changes to vision_worker.rs
+  useEffect(() => {
+    if (monitors.length === 0) return;
+
+    invoke("update_vision_config", {
+      config: {
+        target_fps: fps,
+        switch_margin_deg: switchMargin,
+        dwell_ms: dwellDelay,
+        cooldown_ms: 800,
+        smoothing_alpha: 0.35,
+        auto_pause_fullscreen: gamingPause,
+        teleport_cursor: cursorTeleport,
+        excluded_processes: [],
+        monitors: monitors.map((m) => ({
+          id: m.id,
+          display_index: m.displayIndex,
+          enabled: m.enabled,
+          desk_pos: {
+            x: Math.round(m.deskPos.x),
+            y: Math.round(m.deskPos.y),
+            width: Math.round(m.deskPos.width),
+            height: Math.round(m.deskPos.height),
+          },
+          anchor_yaw: null,
+          anchor_pitch: null,
+        })),
+      },
+    }).catch(() => {});
+  }, [fps, switchMargin, dwellDelay, gamingPause, cursorTeleport, monitors]);
+
+  // 4. Periodic polling loop for Auto-Yield & Fullscreen gaming status
   useEffect(() => {
     const timer = setInterval(async () => {
       if (!trackingEnabled) {
@@ -124,7 +202,6 @@ export default function App() {
       }
 
       try {
-        // Check gaming / fullscreen state
         if (gamingPause) {
           const isGaming = await invoke<boolean>("check_fullscreen_state");
           if (isGaming) {
@@ -133,7 +210,6 @@ export default function App() {
           }
         }
 
-        // Check camera status & ConsentStore conflicts
         const camStatus = await invoke<CameraStatus>("get_camera_status");
         if (camStatus.is_yielded) {
           setSystemStatus("yielded");
@@ -145,30 +221,53 @@ export default function App() {
       } catch {
         // Dev mode fallback
       }
-    }, 1500);
+    }, 1000);
 
     return () => clearInterval(timer);
   }, [trackingEnabled, gamingPause]);
+
+  // 5. High-frequency telemetry poll for live Head Pose reticle & FPS readout
+  useEffect(() => {
+    const timer = setInterval(async () => {
+      try {
+        const tel = await invoke<VisionTelemetry>("get_vision_telemetry");
+        setTelemetry(tel);
+      } catch {
+        // Dev browser fallback
+      }
+    }, 150);
+
+    return () => clearInterval(timer);
+  }, []);
+
+  // Map smoothed yaw (-35..+35 deg) & pitch (-20..+20 deg) to Gaze Pad % coordinates
+  const reticleLeftPct = Math.min(95, Math.max(5, 50 + (telemetry.smoothed_yaw / 35) * 45));
+  const reticleTopPct = Math.min(92, Math.max(8, 50 - (telemetry.smoothed_pitch / 20) * 42));
 
   return (
     <div className="relative min-h-screen w-full overflow-hidden bg-zinc-950 text-zinc-100 flex flex-col font-sans select-none">
       {/* 1. Frameless Header Bar */}
       <TitleBar
         trackingEnabled={trackingEnabled}
-        onToggleTracking={setTrackingEnabled}
+        onToggleTracking={handleToggleTracking}
         status={systemStatus}
         yieldedAppName={yieldedAppName}
         fps={fps}
+        measuredFps={telemetry.measured_fps}
       />
 
       {/* 2. Bento Grid Dashboard Canvas */}
       <main className="flex-1 p-3 grid grid-cols-1 md:grid-cols-2 gap-3 overflow-hidden">
-        {/* Top-Left: Active Displays (Phase 1 & 2 Spatial + Win32 Focus) */}
+        {/* Top-Left: Active Displays (Phase 1, 2 & 4 live focus sync) */}
         <div className="h-full">
-          <ActiveDisplaysCard cursorTeleport={cursorTeleport} />
+          <ActiveDisplaysCard
+            cursorTeleport={cursorTeleport}
+            focusedMonitorId={telemetry.focused_monitor_id}
+            onMonitorsChange={setMonitors}
+          />
         </div>
 
-        {/* Top-Right: Tracking Settings (Phase 3 Hardware Webcam & FPS Controls) */}
+        {/* Top-Right: Tracking Settings */}
         <Card className="flex flex-col bg-zinc-900/60 border-zinc-800/80 shadow-md">
           <CardHeader className="py-2.5 px-3 border-b border-zinc-800/60 flex flex-row items-center justify-between space-y-0">
             <div className="flex items-center gap-2">
@@ -269,52 +368,74 @@ export default function App() {
           </CardContent>
         </Card>
 
-        {/* Bottom-Left: Head Pose & Calibration Preview */}
+        {/* Bottom-Left: Live Head Pose & Adaptive 1D/2D Gaze Pad */}
         <Card className="flex flex-col bg-zinc-900/60 border-zinc-800/80 shadow-md">
           <CardHeader className="py-2.5 px-3 border-b border-zinc-800/60 flex flex-row items-center justify-between space-y-0">
             <div className="flex items-center gap-2">
               <Compass className="h-4 w-4 text-emerald-400" />
               <CardTitle className="text-xs font-semibold text-zinc-100 uppercase tracking-wider">
-                Head Pose & Calibration (2D Gaze Pad)
+                Head Pose ({telemetry.is_2d_layout ? "2D Gaze Pad" : "1D Yaw Zone"})
               </CardTitle>
             </div>
             <Badge variant="outline" className="text-[10px] px-1.5 py-0 border-zinc-700 bg-zinc-800/40 text-emerald-400">
-              FSANet ONNX
+              YuNet + FSANet CPU
             </Badge>
           </CardHeader>
 
           <CardContent className="p-3 flex-1 flex flex-col justify-between">
-            <div className="relative w-full h-[120px] rounded-lg border border-zinc-800 bg-zinc-950/70 flex items-center justify-center overflow-hidden">
-              <div className="absolute inset-x-0 h-[1px] bg-zinc-800" />
-              <div className="absolute inset-y-0 w-[1px] bg-zinc-800" />
+            <div className="relative w-full h-[120px] rounded-lg border border-zinc-800 bg-zinc-950/70 overflow-hidden">
+              <div className="absolute inset-x-0 top-1/2 h-[1px] bg-zinc-800" />
+              <div className="absolute inset-y-0 left-1/2 w-[1px] bg-zinc-800" />
 
-              <span className="absolute top-1 left-2 font-mono text-[9px] text-zinc-400">+15° Pitch</span>
-              <span className="absolute bottom-1 left-2 font-mono text-[9px] text-zinc-400">-15° Pitch</span>
-              <span className="absolute right-2 top-1 font-mono text-[9px] text-zinc-400">+25° Yaw</span>
+              <span className="absolute top-1 left-2 font-mono text-[9px] text-zinc-400">+20° Pitch</span>
+              <span className="absolute bottom-1 left-2 font-mono text-[9px] text-zinc-400">-20° Pitch</span>
+              <span className="absolute right-2 top-1 font-mono text-[9px] text-zinc-400">+35° Yaw</span>
 
-              <div className="relative z-10 flex items-center justify-center">
-                <div className="h-4 w-4 rounded-full border border-emerald-400 bg-emerald-500/20 flex items-center justify-center animate-pulse">
-                  <div className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+              {/* Live Smoothed Reticle */}
+              <div
+                style={{ left: `${reticleLeftPct}%`, top: `${reticleTopPct}%` }}
+                className="absolute -translate-x-1/2 -translate-y-1/2 z-10 transition-all duration-100"
+              >
+                <div
+                  className={`h-4 w-4 rounded-full border flex items-center justify-center ${
+                    telemetry.face_detected
+                      ? "border-emerald-400 bg-emerald-500/25 shadow-[0_0_10px_rgba(16,185,129,0.5)]"
+                      : "border-zinc-600 bg-zinc-800/40"
+                  }`}
+                >
+                  <div
+                    className={`h-1.5 w-1.5 rounded-full ${
+                      telemetry.face_detected ? "bg-emerald-400" : "bg-zinc-500"
+                    }`}
+                  />
                 </div>
               </div>
 
-              <div className="absolute left-[30%] top-[40%] flex items-center gap-1 opacity-70">
-                <span className="h-2 w-2 rounded-full bg-blue-400" />
-                <span className="font-mono text-[8px] text-blue-300">M1</span>
-              </div>
-              <div className="absolute right-[30%] top-[40%] flex items-center gap-1 opacity-70">
-                <span className="h-2 w-2 rounded-full bg-blue-400" />
-                <span className="font-mono text-[8px] text-blue-300">M2</span>
-              </div>
-              <div className="absolute left-[50%] top-[20%] flex items-center gap-1 opacity-70">
-                <span className="h-2 w-2 rounded-full bg-amber-400" />
-                <span className="font-mono text-[8px] text-amber-300">M3</span>
-              </div>
+              {/* Dwell progress bar when switching monitors */}
+              {telemetry.pending_monitor_id && (
+                <div className="absolute bottom-0 inset-x-0 h-1 bg-zinc-800">
+                  <div
+                    className="h-full bg-emerald-400 transition-all duration-75"
+                    style={{ width: `${Math.round(telemetry.pending_progress * 100)}%` }}
+                  />
+                </div>
+              )}
             </div>
 
             <div className="pt-2 flex items-center justify-between text-[11px] text-zinc-400 font-mono">
-              <span>Yaw: +12.4° · Pitch: -2.1°</span>
-              <span className="text-emerald-400">YuNet Conf: 0.94</span>
+              <span>
+                Yaw: {telemetry.smoothed_yaw >= 0 ? "+" : ""}
+                {telemetry.smoothed_yaw.toFixed(1)}° · Pitch:{" "}
+                {telemetry.smoothed_pitch >= 0 ? "+" : ""}
+                {telemetry.smoothed_pitch.toFixed(1)}°
+              </span>
+              <span className={telemetry.face_detected ? "text-emerald-400" : "text-zinc-500"}>
+                {telemetry.last_error
+                  ? "Model/Cam Wait"
+                  : telemetry.face_detected
+                  ? `YuNet Conf: ${telemetry.face_confidence.toFixed(2)}`
+                  : "No Face"}
+              </span>
             </div>
           </CardContent>
         </Card>
@@ -334,7 +455,6 @@ export default function App() {
           </CardHeader>
 
           <CardContent className="p-3 space-y-2 flex-1 flex flex-col justify-between text-xs">
-            {/* Auto-Yield Toggle (Phase 3 Core Safeguard) */}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Video className="h-3.5 w-3.5 text-zinc-400" />
@@ -346,7 +466,6 @@ export default function App() {
               <Switch checked={autoYield} onCheckedChange={handleAutoYieldToggle} />
             </div>
 
-            {/* Gaming & Fullscreen Auto-Pause */}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Gamepad2 className="h-3.5 w-3.5 text-zinc-400" />
@@ -358,7 +477,6 @@ export default function App() {
               <Switch checked={gamingPause} onCheckedChange={setGamingPause} />
             </div>
 
-            {/* Battery Eco Mode */}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <BatteryCharging className="h-3.5 w-3.5 text-zinc-400" />
@@ -370,7 +488,6 @@ export default function App() {
               <Switch checked={batteryEco} onCheckedChange={setBatteryEco} />
             </div>
 
-            {/* Cursor Teleport */}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <CornerDownRight className="h-3.5 w-3.5 text-zinc-400" />
@@ -404,7 +521,7 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-3">
-          <span>v1.0.0-phase3</span>
+          <span>v1.0.0-phase4</span>
           <span className="text-zinc-400">·</span>
           <span className="text-emerald-400/90 font-medium">100% Volatile RAM</span>
         </div>
