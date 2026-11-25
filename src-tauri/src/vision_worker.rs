@@ -777,6 +777,10 @@ impl VisionWorkerHandle {
         self.camera.set_tracking_enabled(enabled);
     }
 
+    pub fn is_tracking_enabled(&self) -> bool {
+        self.tracking_enabled.load(Ordering::Relaxed)
+    }
+
     pub fn update_config(&self, new_config: VisionConfig) {
         if let Ok(mut cfg) = self.config.write() {
             *cfg = new_config;

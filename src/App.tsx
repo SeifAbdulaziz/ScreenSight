@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { TitleBar, SystemStatus } from "@/components/TitleBar";
 import { ActiveDisplaysCard } from "@/components/ActiveDisplaysCard";
 import { MonitorInfo } from "@/lib/monitorLayout";
@@ -226,8 +227,28 @@ export default function App() {
     return () => clearInterval(timer);
   }, [trackingEnabled, gamingPause]);
 
-  // 5. High-frequency telemetry poll for live Head Pose reticle & FPS readout
+  // 5. High-frequency telemetry & tray status event subscription
   useEffect(() => {
+    const unlistenPromise = listen<{ kind: string; detail?: string }>(
+      "screensight://status",
+      (event) => {
+        const s = event.payload;
+        if (s.kind === "ManuallyPaused") {
+          setTrackingEnabled(false);
+          setSystemStatus("paused");
+        } else if (s.kind === "Active") {
+          setTrackingEnabled(true);
+          setSystemStatus("active");
+          setYieldedAppName(null);
+        } else if (s.kind === "PausedFullscreen") {
+          setSystemStatus("gaming_paused");
+        } else if (s.kind === "YieldedToApp") {
+          setSystemStatus("yielded");
+          setYieldedAppName(s.detail ?? null);
+        }
+      }
+    );
+
     const timer = setInterval(async () => {
       try {
         const tel = await invoke<VisionTelemetry>("get_vision_telemetry");
@@ -237,7 +258,10 @@ export default function App() {
       }
     }, 150);
 
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      unlistenPromise.then((fn) => fn()).catch(() => {});
+    };
   }, []);
 
   // Map smoothed yaw (-35..+35 deg) & pitch (-20..+20 deg) to Gaze Pad % coordinates
@@ -521,7 +545,7 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-3">
-          <span>v1.0.0-phase4</span>
+          <span>v1.0.0-phase5</span>
           <span className="text-zinc-400">·</span>
           <span className="text-emerald-400/90 font-medium">100% Volatile RAM</span>
         </div>

@@ -185,6 +185,113 @@ pub fn find_top_window_on_monitor(
     state.found_hwnd.map(|hwnd| (hwnd, state.found_title))
 }
 
+struct MultiMonitorWindowSearch<'a> {
+    monitors: &'a [SystemMonitor],
+    own_pid: u32,
+    excluded_names: &'a [String],
+    found: std::collections::HashMap<String, String>,
+}
+
+/// Single-pass `EnumWindows` traversal that records the top visible, non-cloaked
+/// window title for every connected monitor in one Z-order walk.
+pub fn find_top_windows_for_monitors(
+    monitors: &[SystemMonitor],
+    excluded_names: &[String],
+) -> std::collections::HashMap<String, String> {
+    let own_pid = unsafe { GetCurrentProcessId() };
+    let mut state = MultiMonitorWindowSearch {
+        monitors,
+        own_pid,
+        excluded_names,
+        found: std::collections::HashMap::with_capacity(monitors.len()),
+    };
+
+    unsafe {
+        let lparam = LPARAM(&mut state as *mut MultiMonitorWindowSearch as isize);
+        let _ = EnumWindows(Some(enum_multi_windows_callback), lparam);
+    }
+
+    state.found
+}
+
+unsafe extern "system" fn enum_multi_windows_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let state = &mut *(lparam.0 as *mut MultiMonitorWindowSearch);
+
+    if state.found.len() >= state.monitors.len() {
+        return BOOL(0);
+    }
+
+    if !IsWindowVisible(hwnd).as_bool() {
+        return BOOL(1);
+    }
+
+    let mut cloaked: u32 = 0;
+    let hr = DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_CLOAKED,
+        &mut cloaked as *mut u32 as *mut _,
+        size_of::<u32>() as u32,
+    );
+    if hr.is_ok() && cloaked != 0 {
+        return BOOL(1);
+    }
+
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    if (ex_style & WS_EX_TOOLWINDOW.0) != 0 {
+        return BOOL(1);
+    }
+
+    let mut window_pid: u32 = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
+    if window_pid == 0 || window_pid == state.own_pid {
+        return BOOL(1);
+    }
+
+    if !state.excluded_names.is_empty() {
+        if let Some(exe_name) = get_window_process_name(hwnd) {
+            let lower_exe = exe_name.to_lowercase();
+            if state
+                .excluded_names
+                .iter()
+                .any(|ex| lower_exe.contains(&ex.to_lowercase()))
+            {
+                return BOOL(1);
+            }
+        }
+    }
+
+    let mut rect = RECT::default();
+    if GetWindowRect(hwnd, &mut rect).is_err() {
+        return BOOL(1);
+    }
+
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 10 || height <= 10 {
+        return BOOL(1);
+    }
+
+    let center_x = rect.left + width / 2;
+    let center_y = rect.top + height / 2;
+
+    if let Some(monitor) = state
+        .monitors
+        .iter()
+        .find(|m| !state.found.contains_key(&m.id) && m.os_rect.contains_point(center_x, center_y))
+    {
+        let mut text_buf = [0u16; 512];
+        let len = GetWindowTextW(hwnd, &mut text_buf);
+        if len > 0 {
+            let title = String::from_utf16_lossy(&text_buf[..len as usize]);
+            if !title.trim().is_empty() && title != "Program Manager" {
+                state.found.insert(monitor.id.clone(), title);
+            }
+        }
+    }
+
+    BOOL(1)
+}
+
 unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let state = &mut *(lparam.0 as *mut WindowSearchState);
 

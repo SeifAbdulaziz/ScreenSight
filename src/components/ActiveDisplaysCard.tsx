@@ -367,10 +367,11 @@ export function ActiveDisplaysCard({
     setTimeout(() => setStatusMessage(null), 3500);
   };
 
-  // Flash identity badges
+  // Flash identity badges (on physical screens via Tauri overlays + in-card fallback)
   const handleIdentify = () => {
     setShowIdentityBadges(true);
-    setTimeout(() => setShowIdentityBadges(false), 3000);
+    invoke("identify_monitors").catch(() => {});
+    setTimeout(() => setShowIdentityBadges(false), 2500);
   };
 
   // Active projection layout
