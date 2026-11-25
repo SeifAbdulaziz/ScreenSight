@@ -101,6 +101,12 @@ export function ExclusionsDialog({
           </div>
         </div>
 
+        <p className="text-[11px] leading-relaxed text-zinc-400 rounded-md border border-zinc-800/80 bg-zinc-900/40 px-2.5 py-2">
+          Windows UAC / UIPI Note: Because ScreenSight runs with standard user
+          permissions by default, Windows blocks switching focus onto windows
+          running as Administrator (such as Task Manager or an elevated terminal).
+        </p>
+
         <DialogFooter>
           <Button variant="outline" size="sm" onClick={() => onOpenChange(false)}>
             Done

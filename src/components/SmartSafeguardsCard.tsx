@@ -12,6 +12,12 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { ExclusionsDialog } from "@/components/ExclusionsDialog";
 import type { AppConfig } from "@/types/screensight";
 
@@ -39,13 +45,22 @@ export function SmartSafeguardsCard({
             Smart Safeguards
           </CardTitle>
         </div>
-        <Badge
-          variant="outline"
-          className="text-[10px] px-1.5 py-0 border-zinc-700 bg-zinc-800/40 text-zinc-400 shrink-0"
-          title="Standard non-elevated Windows permissions cannot switch focus onto Administrator-elevated windows (UIPI)."
-        >
-          Win32 Safe
-        </Badge>
+        <TooltipProvider delayDuration={150}>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Badge
+                variant="outline"
+                className="text-[10px] px-1.5 py-0 border-zinc-700 bg-zinc-800/40 text-zinc-400 shrink-0 cursor-help"
+              >
+                Win32 UIPI
+              </Badge>
+            </TooltipTrigger>
+            <TooltipContent side="left" className="max-w-[240px]">
+              Standard non-elevated Windows permissions cannot focus
+              Administrator-elevated windows (e.g., Task Manager).
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
       </CardHeader>
 
       <CardContent className="p-2.5 flex-1 min-h-0 flex flex-col justify-between gap-2 text-xs">

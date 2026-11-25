@@ -580,6 +580,18 @@ impl GazeEngine {
         self.pending_since = None;
     }
 
+    /// Synchronizes `focused_monitor_id` with real OS foreground monitor changes (e.g. mouse clicks)
+    /// without starting a focus cooldown, so looking back at another screen triggers a switch.
+    pub fn sync_os_foreground(&mut self, monitor_id: &str) {
+        if self.focused_monitor_id.as_deref() != Some(monitor_id) {
+            self.focused_monitor_id = Some(monitor_id.to_string());
+            if self.pending_monitor_id.as_deref() == Some(monitor_id) {
+                self.pending_monitor_id = None;
+                self.pending_since = None;
+            }
+        }
+    }
+
     /// Evaluates one head-pose sample through EMA smoothing, 2D nearest-anchor matching,
     /// hysteresis margin, cooldown lock, and wall-clock `Instant` dwell timing.
     pub fn process_pose(
@@ -841,6 +853,7 @@ fn run_vision_loop(
     let mut engine = GazeEngine::new();
     let mut last_frame_at = Instant::now();
     let mut smoothed_fps = 0.0_f32;
+    let mut last_observed_fg_hwnd: usize = 0;
 
     loop {
         let loop_start = Instant::now();
@@ -892,15 +905,46 @@ fn run_vision_loop(
                         match pose_est.estimate(&crop) {
                             Ok(raw_pose) => {
                                 let now = Instant::now();
+                                // Keep GazeEngine synced with manual clicks / Alt+Tab foreground changes.
+                                if let Some((fg_hwnd, fg_mon)) =
+                                    win32_focus::get_foreground_window_monitor()
+                                {
+                                    if fg_hwnd != last_observed_fg_hwnd {
+                                        last_observed_fg_hwnd = fg_hwnd;
+                                        if cfg.monitors.iter().any(|m| m.enabled && m.id == fg_mon) {
+                                            engine.sync_os_foreground(&fg_mon);
+                                        }
+                                    }
+                                }
+
                                 let (decision, is_2d, distances, progress) =
                                     engine.process_pose(raw_pose, &cfg, now);
 
                                 if let GazeDecision::SwitchFocus(target_id) = decision {
-                                    let _ = win32_focus::switch_focus_to_monitor(
+                                    match win32_focus::switch_focus_to_monitor(
                                         &target_id,
                                         cfg.teleport_cursor,
                                         &cfg.excluded_processes,
-                                    );
+                                    ) {
+                                        Ok(Some(info)) => {
+                                            last_observed_fg_hwnd = info.hwnd;
+                                        }
+                                        Ok(None) => {}
+                                        Err(_) => {
+                                            if let Some((fg_hwnd, fg_mon)) =
+                                                win32_focus::get_foreground_window_monitor()
+                                            {
+                                                last_observed_fg_hwnd = fg_hwnd;
+                                                if cfg
+                                                    .monitors
+                                                    .iter()
+                                                    .any(|m| m.enabled && m.id == fg_mon)
+                                                {
+                                                    engine.sync_os_foreground(&fg_mon);
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
 
                                 if let Ok(mut tel) = telemetry.lock() {
@@ -1000,6 +1044,21 @@ mod tests {
         let blank_crop = RgbImage::new(64, 64);
         let pose = estimator.estimate(&blank_crop).expect("FSANet infer succeeded");
         assert!(pose.yaw.is_finite() && pose.pitch.is_finite() && pose.roll.is_finite());
+
+        // Release-mode per-frame latency sanity benchmark (15 FPS budget = 66.6ms, 30 FPS = 33.3ms).
+        let iterations = 10_u32;
+        let bench_start = Instant::now();
+        for _ in 0..iterations {
+            let _ = detector.detect_primary_face(&blank_frame).expect("YuNet bench infer");
+            let _ = estimator.estimate(&blank_crop).expect("FSANet bench infer");
+        }
+        let avg_ms = bench_start.elapsed().as_secs_f64() * 1000.0 / f64::from(iterations);
+        eprintln!("ONNX two-stage pipeline avg latency: {avg_ms:.2} ms/frame");
+        #[cfg(not(debug_assertions))]
+        assert!(
+            avg_ms < 66.6,
+            "Release pipeline ({avg_ms:.2} ms/frame) exceeded 15 FPS budget (66.6 ms)"
+        );
     }
 
     #[test]
@@ -1101,5 +1160,41 @@ mod tests {
         let (dec, is_2d, _, _) = engine.process_pose(HeadPose { yaw: 0.0, pitch: 12.0, roll: 0.0 }, &cfg, t1 + Duration::from_millis(1));
         assert!(is_2d);
         assert_eq!(dec, GazeDecision::SwitchFocus("TOP".to_string()));
+    }
+
+    #[test]
+    fn test_sync_os_foreground_enables_switch_back_after_manual_click() {
+        let cfg = VisionConfig {
+            smoothing_alpha: 1.0,
+            switch_margin_deg: 6.0,
+            dwell_ms: 0,
+            cooldown_ms: 0,
+            monitors: vec![
+                make_monitor("LEFT", 0, 0, 1920, 1080, Some(-20.0), Some(0.0)),
+                make_monitor("RIGHT", 1920, 0, 1920, 1080, Some(20.0), Some(0.0)),
+            ],
+            ..VisionConfig::default()
+        };
+
+        let mut engine = GazeEngine::new();
+        let t0 = Instant::now();
+
+        // User initially looks at LEFT
+        engine.process_pose(HeadPose { yaw: -20.0, pitch: 0.0, roll: 0.0 }, &cfg, t0);
+        assert_eq!(engine.focused_monitor_id.as_deref(), Some("LEFT"));
+
+        // User manually clicks an app on RIGHT (OS foreground becomes RIGHT)
+        engine.sync_os_foreground("RIGHT");
+        assert_eq!(engine.focused_monitor_id.as_deref(), Some("RIGHT"));
+
+        // User looks at LEFT to type -> must detect RIGHT != LEFT and fire SwitchFocus("LEFT")
+        let t1 = t0 + Duration::from_millis(50);
+        engine.process_pose(HeadPose { yaw: -20.0, pitch: 0.0, roll: 0.0 }, &cfg, t1);
+        let (dec, _, _, _) = engine.process_pose(
+            HeadPose { yaw: -20.0, pitch: 0.0, roll: 0.0 },
+            &cfg,
+            t1 + Duration::from_millis(1),
+        );
+        assert_eq!(dec, GazeDecision::SwitchFocus("LEFT".to_string()));
     }
 }

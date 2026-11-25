@@ -12,7 +12,8 @@ use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR, MONITORINFOEXW,
+    MONITOR_DEFAULTTONULL,
 };
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId, OpenProcess,
@@ -22,9 +23,10 @@ use windows::Win32::UI::Shell::{
     SHQueryUserNotificationState, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowLongW, GetWindowRect,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetCursorPos,
-    SetForegroundWindow, ShowWindow, GWL_EXSTYLE, SW_RESTORE, WS_EX_TOOLWINDOW,
+    AllowSetForegroundWindow, BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow,
+    GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindowVisible, PeekMessageW, SetCursorPos, SetForegroundWindow, ShowWindow, ASFW_ANY,
+    GWL_EXSTYLE, MSG, PM_NOREMOVE, SW_RESTORE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 /// 2D Rect in Windows Virtual Desktop coordinates.
@@ -214,17 +216,76 @@ pub fn find_top_windows_for_monitors(
     state.found
 }
 
-unsafe extern "system" fn enum_multi_windows_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let state = &mut *(lparam.0 as *mut MultiMonitorWindowSearch);
-
-    if state.found.len() >= state.monitors.len() {
-        return BOOL(0);
+/// Extracts the Win32 `szDevice` monitor identifier (e.g. `\\.\DISPLAY1`) for a window handle.
+pub fn get_monitor_id_for_hwnd(hwnd: HWND) -> Option<String> {
+    if hwnd.0.is_null() {
+        return None;
     }
 
-    if !IsWindowVisible(hwnd).as_bool() {
-        return BOOL(1);
+    unsafe {
+        let hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+        if hmonitor.0.is_null() {
+            return None;
+        }
+
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(hmonitor, &mut info as *mut MONITORINFOEXW as *mut _).as_bool() {
+            let name_len = info
+                .szDevice
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(info.szDevice.len());
+            return Some(String::from_utf16_lossy(&info.szDevice[..name_len]));
+        }
+        None
+    }
+}
+
+/// Returns `(hwnd_as_usize, monitor_id)` for the OS window currently receiving keyboard input.
+///
+/// Used by the vision worker so manual mouse clicks or Alt+Tab immediately keep `GazeEngine`
+/// aligned with real Windows keyboard focus instead of assuming the previously focused screen.
+pub fn get_foreground_window_monitor() -> Option<(usize, String)> {
+    unsafe {
+        let fg_hwnd = GetForegroundWindow();
+        if fg_hwnd.0.is_null() {
+            return None;
+        }
+        get_monitor_id_for_hwnd(fg_hwnd).map(|id| (fg_hwnd.0 as usize, id))
+    }
+}
+
+fn is_non_app_shell_class(hwnd: HWND) -> bool {
+    let mut cls_buf = [0u16; 128];
+    let len = unsafe { GetClassNameW(hwnd, &mut cls_buf) };
+    if len <= 0 {
+        return false;
+    }
+    let class_name = String::from_utf16_lossy(&cls_buf[..len as usize]);
+    matches!(
+        class_name.as_str(),
+        "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "Progman"
+            | "WorkerW"
+            | "Windows.UI.Core.CoreWindow"
+    )
+}
+
+/// Shared eligibility filter for Z-order window enumeration across both single-monitor
+/// focus switching and multi-monitor dashboard title snapshots.
+unsafe fn extract_eligible_window(
+    hwnd: HWND,
+    own_pid: u32,
+    excluded_names: &[String],
+) -> Option<(RECT, String)> {
+    // 1. Window must be marked visible and not minimized to taskbar (-32000,-32000).
+    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+        return None;
     }
 
+    // 2. Skip DWM-cloaked UWP/suspended windows and windows on other Virtual Desktops.
     let mut cloaked: u32 = 0;
     let hr = DwmGetWindowAttribute(
         hwnd,
@@ -233,60 +294,79 @@ unsafe extern "system" fn enum_multi_windows_callback(hwnd: HWND, lparam: LPARAM
         size_of::<u32>() as u32,
     );
     if hr.is_ok() && cloaked != 0 {
-        return BOOL(1);
+        return None;
     }
 
+    // 3. Skip floating tool windows and non-activatable HUD/overlay windows.
     let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-    if (ex_style & WS_EX_TOOLWINDOW.0) != 0 {
-        return BOOL(1);
+    if (ex_style & (WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0)) != 0 {
+        return None;
     }
 
+    // 4. Skip ScreenSight's own UI/overlays and Windows desktop/taskbar shell frames.
     let mut window_pid: u32 = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
-    if window_pid == 0 || window_pid == state.own_pid {
-        return BOOL(1);
+    if window_pid == 0 || window_pid == own_pid || is_non_app_shell_class(hwnd) {
+        return None;
     }
 
-    if !state.excluded_names.is_empty() {
+    // 5. Apply user process exclusion rules (e.g. games, OBS).
+    if !excluded_names.is_empty() {
         if let Some(exe_name) = get_window_process_name(hwnd) {
             let lower_exe = exe_name.to_lowercase();
-            if state
-                .excluded_names
+            if excluded_names
                 .iter()
                 .any(|ex| lower_exe.contains(&ex.to_lowercase()))
             {
-                return BOOL(1);
+                return None;
             }
         }
     }
 
+    // 6. Validate window bounds and non-empty title.
     let mut rect = RECT::default();
     if GetWindowRect(hwnd, &mut rect).is_err() {
-        return BOOL(1);
+        return None;
+    }
+    if (rect.right - rect.left) <= 10 || (rect.bottom - rect.top) <= 10 {
+        return None;
     }
 
-    let width = rect.right - rect.left;
-    let height = rect.bottom - rect.top;
-    if width <= 10 || height <= 10 {
-        return BOOL(1);
+    let mut text_buf = [0u16; 512];
+    let len = GetWindowTextW(hwnd, &mut text_buf);
+    if len <= 0 {
+        return None;
     }
 
-    let center_x = rect.left + width / 2;
-    let center_y = rect.top + height / 2;
+    let title = String::from_utf16_lossy(&text_buf[..len as usize]);
+    if title.trim().is_empty() || title == "Program Manager" {
+        return None;
+    }
+
+    Some((rect, title))
+}
+
+unsafe extern "system" fn enum_multi_windows_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let state = &mut *(lparam.0 as *mut MultiMonitorWindowSearch);
+
+    if state.found.len() >= state.monitors.len() {
+        return BOOL(0);
+    }
+
+    let Some((rect, title)) = extract_eligible_window(hwnd, state.own_pid, state.excluded_names)
+    else {
+        return BOOL(1);
+    };
+
+    let center_x = rect.left + (rect.right - rect.left) / 2;
+    let center_y = rect.top + (rect.bottom - rect.top) / 2;
 
     if let Some(monitor) = state
         .monitors
         .iter()
         .find(|m| !state.found.contains_key(&m.id) && m.os_rect.contains_point(center_x, center_y))
     {
-        let mut text_buf = [0u16; 512];
-        let len = GetWindowTextW(hwnd, &mut text_buf);
-        if len > 0 {
-            let title = String::from_utf16_lossy(&text_buf[..len as usize]);
-            if !title.trim().is_empty() && title != "Program Manager" {
-                state.found.insert(monitor.id.clone(), title);
-            }
-        }
+        state.found.insert(monitor.id.clone(), title);
     }
 
     BOOL(1)
@@ -295,89 +375,22 @@ unsafe extern "system" fn enum_multi_windows_callback(hwnd: HWND, lparam: LPARAM
 unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let state = &mut *(lparam.0 as *mut WindowSearchState);
 
-    // Filter 1: Window must be marked visible by the OS
-    if !IsWindowVisible(hwnd).as_bool() {
+    let Some((rect, title)) = extract_eligible_window(hwnd, state.own_pid, state.excluded_names)
+    else {
         return BOOL(1);
-    }
+    };
 
-    // Filter 2: Must NOT be cloaked by Desktop Window Manager (DWM).
-    // RUST LEARN NOTE:
-    // On Windows 10/11, suspended UWP apps, hidden background tasks, and windows
-    // located on other Virtual Desktops still return true for IsWindowVisible(),
-    // but DwmGetWindowAttribute flags them as DWMWA_CLOAKED.
-    let mut cloaked: u32 = 0;
-    let hr = DwmGetWindowAttribute(
-        hwnd,
-        DWMWA_CLOAKED,
-        &mut cloaked as *mut u32 as *mut _,
-        size_of::<u32>() as u32,
-    );
-    if hr.is_ok() && cloaked != 0 {
-        return BOOL(1);
-    }
+    let center_x = rect.left + (rect.right - rect.left) / 2;
+    let center_y = rect.top + (rect.bottom - rect.top) / 2;
 
-    // Filter 3: Must NOT have WS_EX_TOOLWINDOW style (excludes floating tooltips/tray popups)
-    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-    if (ex_style & WS_EX_TOOLWINDOW.0) != 0 {
-        return BOOL(1);
-    }
-
-    // Filter 4: Must NOT belong to ScreenSight's own process
-    let mut window_pid: u32 = 0;
-    GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
-    if window_pid == 0 || window_pid == state.own_pid {
-        return BOOL(1);
-    }
-
-    // Filter 5: Check process exclusion list (e.g. games or OBS)
-    if !state.excluded_names.is_empty() {
-        if let Some(exe_name) = get_window_process_name(hwnd) {
-            let lower_exe = exe_name.to_lowercase();
-            if state
-                .excluded_names
-                .iter()
-                .any(|ex| lower_exe.contains(&ex.to_lowercase()))
-            {
-                return BOOL(1);
-            }
-        }
-    }
-
-    // Filter 6: Window dimensions and spatial hit-test
-    let mut rect = RECT::default();
-    if GetWindowRect(hwnd, &mut rect).is_err() {
-        return BOOL(1);
-    }
-
-    let width = rect.right - rect.left;
-    let height = rect.bottom - rect.top;
-    // Skip empty or zero-sized helper windows
-    if width <= 10 || height <= 10 {
-        return BOOL(1);
-    }
-
-    let center_x = rect.left + width / 2;
-    let center_y = rect.top + height / 2;
-
-    // Check if window center point falls inside our target monitor's bounds
+    // EnumWindows traverses top-to-bottom in Z-order, so the first hit is top-most.
     if state.target_rect.contains_point(center_x, center_y) {
-        // Query the window title text
-        let mut text_buf = [0u16; 512];
-        let len = GetWindowTextW(hwnd, &mut text_buf);
-        if len > 0 {
-            let title = String::from_utf16_lossy(&text_buf[..len as usize]);
-            // Skip untitled system artifacts or shell trays
-            if !title.trim().is_empty() && title != "Program Manager" {
-                state.found_hwnd = Some(hwnd);
-                state.found_title = title;
-                // Return FALSE to stop enumeration: EnumWindows visits front-to-back in Z-order,
-                // so the very first matching window is guaranteed to be the top-most visible one!
-                return BOOL(0);
-            }
-        }
+        state.found_hwnd = Some(hwnd);
+        state.found_title = title;
+        return BOOL(0);
     }
 
-    BOOL(1) // Continue search
+    BOOL(1)
 }
 
 /// Helper to query the base `.exe` image filename for a given window handle.
@@ -417,49 +430,78 @@ pub fn get_window_process_name(hwnd: HWND) -> Option<String> {
 
 /// Shifts active OS keyboard and window focus to `target_hwnd`.
 ///
-/// RUST LEARN NOTE (Foreground Lock Bypass):
-/// On modern Windows, a background process cannot simply call `SetForegroundWindow()`.
-/// Doing so causes the window's taskbar icon to flash orange instead of taking focus.
-///
-/// To bypass this restriction safely:
-/// 1. We query the thread ID of the window currently in the foreground.
-/// 2. We attach our thread's input queue to that thread via `AttachThreadInput(..., true)`.
-/// 3. We call `SetForegroundWindow(target_hwnd)`.
-/// 4. We immediately detach our thread via `AttachThreadInput(..., false)`.
+/// RUST LEARN NOTE (Message Queue + Multi-Thread `AttachThreadInput`):
+/// 1. `AttachThreadInput` fails silently if a background worker thread has never created a
+///    Win32 USER message queue; calling `PeekMessageW(..., PM_NOREMOVE)` initializes it.
+/// 2. We attach our thread to BOTH the current foreground thread AND `target_hwnd`'s thread
+///    (as well as `foreground <-> target`) so Windows transfers true keyboard input focus
+///    across distinct processes instead of only flashing the taskbar button.
+/// 3. We verify `GetForegroundWindow()` afterward rather than trusting `SetForegroundWindow()`'s
+///    return value blindly.
 pub fn focus_window(target_hwnd: HWND, cursor_teleport: Option<(i32, i32)>) -> bool {
     unsafe {
-        // 1. If window is minimized, restore it first
         if IsIconic(target_hwnd).as_bool() {
             let _ = ShowWindow(target_hwnd, SW_RESTORE);
         }
 
-        // 2. Query thread IDs for input queue attachment
         let foreground_hwnd = GetForegroundWindow();
-        let foreground_tid = GetWindowThreadProcessId(foreground_hwnd, None);
-        let current_tid = GetCurrentThreadId();
-
-        let mut attached = false;
-        if foreground_tid != 0 && foreground_tid != current_tid {
-            // Attach input queues so Windows treats us as having foreground rights
-            attached = AttachThreadInput(current_tid, foreground_tid, true).as_bool();
+        if foreground_hwnd == target_hwnd {
+            if let Some((cx, cy)) = cursor_teleport {
+                let _ = SetCursorPos(cx, cy);
+            }
+            return true;
         }
 
-        // 3. Switch foreground window
-        let success = SetForegroundWindow(target_hwnd).as_bool();
+        // Ensure this worker thread owns a Win32 message queue before calling AttachThreadInput.
+        let mut msg = MSG::default();
+        let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
 
-        // 4. Detach input queues immediately to avoid input lag or deadlocks
-        if attached {
+        let foreground_tid = if foreground_hwnd.0.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground_hwnd, None)
+        };
+        let target_tid = GetWindowThreadProcessId(target_hwnd, None);
+        let current_tid = GetCurrentThreadId();
+
+        let attach_fg = foreground_tid != 0
+            && foreground_tid != current_tid
+            && AttachThreadInput(current_tid, foreground_tid, true).as_bool();
+        let attach_target = target_tid != 0
+            && target_tid != current_tid
+            && target_tid != foreground_tid
+            && AttachThreadInput(current_tid, target_tid, true).as_bool();
+        let attach_fg_target = foreground_tid != 0
+            && target_tid != 0
+            && foreground_tid != target_tid
+            && AttachThreadInput(foreground_tid, target_tid, true).as_bool();
+
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+        let _ = BringWindowToTop(target_hwnd);
+        let api_ok = SetForegroundWindow(target_hwnd).as_bool();
+
+        if attach_fg_target {
+            let _ = AttachThreadInput(foreground_tid, target_tid, false);
+        }
+        if attach_target {
+            let _ = AttachThreadInput(current_tid, target_tid, false);
+        }
+        if attach_fg {
             let _ = AttachThreadInput(current_tid, foreground_tid, false);
         }
 
-        // 5. Optional Cursor Teleportation:
-        // Moves the mouse pointer to the target screen center so mouse wheel
-        // immediately scrolls the newly focused window without physical mouse movement.
-        if let Some((cx, cy)) = cursor_teleport {
-            let _ = SetCursorPos(cx, cy);
+        let fg_after = GetForegroundWindow();
+        // Verify focus actually moved away from the previous window (or landed on target/child).
+        let switched = fg_after == target_hwnd
+            || (api_ok && !fg_after.0.is_null() && fg_after != foreground_hwnd);
+
+        if switched {
+            if let Some((cx, cy)) = cursor_teleport {
+                let _ = SetCursorPos(cx, cy);
+            }
         }
 
-        success
+        switched
     }
 }
 
@@ -583,5 +625,16 @@ mod tests {
         let is_fullscreen = is_fullscreen_game_active();
         // Just verify it evaluates without crashing Win32 FFI
         let _ = is_fullscreen;
+    }
+
+    #[test]
+    fn test_foreground_window_monitor_query_no_crash() {
+        // Must evaluate safely even in headless/background test sessions; when a foreground window
+        // exists, its monitor ID must belong to connected system displays.
+        if let Some((hwnd, monitor_id)) = get_foreground_window_monitor() {
+            assert_ne!(hwnd, 0);
+            let monitors = get_system_monitors();
+            assert!(monitors.iter().any(|m| m.id == monitor_id));
+        }
     }
 }
