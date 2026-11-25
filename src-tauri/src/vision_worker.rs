@@ -179,28 +179,109 @@ pub fn resolve_model_path(file_name: &str, resource_dir: Option<&Path>) -> Resul
 // 3. Tensor Preprocessing & Face Crop Helpers
 // ==============================================================================
 
-/// Resizes `src` to `(target_w, target_h)` and writes BGR `[0.0, 255.0]` float32 pixels
-/// into a pre-allocated NCHW tensor (`[1, 3, H, W]`).
+/// Writes an `RgbImage` into a pre-allocated BGR planar NCHW tensor (`[1, 3, H, W]`),
+/// multiplying pixel values by `value_scale` (`1.0` for YuNet `[0, 255]`, `1.0 / 255.0` for FSANet `[0, 1]`).
+fn write_bgr_nchw(img: &RgbImage, dst: &mut Array4<f32>, value_scale: f32) {
+    for (x, y, pixel) in img.enumerate_pixels() {
+        let [r, g, b] = pixel.0;
+        let yi = y as usize;
+        let xi = x as usize;
+        // Channel 0 = Blue, Channel 1 = Green, Channel 2 = Red (BGR planar)
+        dst[[0, 0, yi, xi]] = f32::from(b) * value_scale;
+        dst[[0, 1, yi, xi]] = f32::from(g) * value_scale;
+        dst[[0, 2, yi, xi]] = f32::from(r) * value_scale;
+    }
+}
+
+/// Resizes `src` directly to `(target_w, target_h)` and writes normalized BGR NCHW floats.
 ///
-/// RUST LEARN NOTE (Tensor Layout & Memory Reuse):
-/// Both OpenCV YuNet and FSANet expect planar NCHW order in **BGR** channel sequence
-/// (OpenCV's native color order) with unnormalized `[0.0, 255.0]` pixel values.
-/// Mutating a pre-allocated `Array4<f32>` avoids ~5 MB/frame of heap allocations at 15-30 FPS.
-fn fill_bgr_nchw_tensor(src: &RgbImage, dst: &mut Array4<f32>, target_w: u32, target_h: u32) {
+/// RUST LEARN NOTE (FSANet Tensor Scaling):
+/// Even though `cam_demo.py` cast uint8 directly to float32, our exported `head_pose.onnx`
+/// (`BatchNormalization_1` `running_mean` in `[-0.81, +0.37]`, `running_var` ~ `0.04`) was
+/// trained on `[0.0, 1.0]` scaled tensors (`1.0 / 255.0`). Feeding `[0, 255]` saturates Conv1 + BN.
+fn fill_bgr_nchw_scaled(
+    src: &RgbImage,
+    dst: &mut Array4<f32>,
+    target_w: u32,
+    target_h: u32,
+    value_scale: f32,
+) {
     let resized = if src.width() == target_w && src.height() == target_h {
         std::borrow::Cow::Borrowed(src)
     } else {
         std::borrow::Cow::Owned(resize(src, target_w, target_h, FilterType::Triangle))
     };
+    write_bgr_nchw(resized.as_ref(), dst, value_scale);
+}
 
-    for (x, y, pixel) in resized.enumerate_pixels() {
-        let [r, g, b] = pixel.0;
-        let yi = y as usize;
-        let xi = x as usize;
-        // Channel 0 = Blue, Channel 1 = Green, Channel 2 = Red (BGR planar)
-        dst[[0, 0, yi, xi]] = f32::from(b);
-        dst[[0, 1, yi, xi]] = f32::from(g);
-        dst[[0, 2, yi, xi]] = f32::from(r);
+/// Fits `src` into `(target_w, target_h)` while preserving aspect ratio via bottom-right
+/// zero-padding (matching OpenCV Zoo YuNet) and returns the uniform inverse scale (`src / dst`).
+///
+/// On native `640x480` webcam frames into `640x640`, `scale = 1.0` avoids any resize blur or
+/// `1.33x` vertical facial stretching.
+pub fn fill_bgr_letterbox_tensor(
+    src: &RgbImage,
+    dst: &mut Array4<f32>,
+    target_w: u32,
+    target_h: u32,
+) -> f32 {
+    let src_w = src.width().max(1);
+    let src_h = src.height().max(1);
+    let scale = (target_w as f32 / src_w as f32).min(target_h as f32 / src_h as f32);
+
+    let fit_w = ((src_w as f32 * scale).round() as u32).clamp(1, target_w);
+    let fit_h = ((src_h as f32 * scale).round() as u32).clamp(1, target_h);
+
+    dst.fill(0.0);
+    if fit_w == src_w && fit_h == src_h {
+        write_bgr_nchw(src, dst, 1.0);
+    } else {
+        let resized = resize(src, fit_w, fit_h, FilterType::Triangle);
+        write_bgr_nchw(&resized, dst, 1.0);
+    }
+
+    1.0 / scale
+}
+
+/// Stabilizes YuNet bounding boxes across frames using a sub-pixel deadband (`1.5 px`) and EMA
+/// so static head posture yields a steady `64x64` FSANet crop instead of grid-cell jitter.
+pub fn stabilize_face_box(prev: Option<FaceBox>, raw: FaceBox) -> FaceBox {
+    let Some(p) = prev else {
+        return raw;
+    };
+
+    let p_cx = p.x + p.width * 0.5;
+    let p_cy = p.y + p.height * 0.5;
+    let r_cx = raw.x + raw.width * 0.5;
+    let r_cy = raw.y + raw.height * 0.5;
+
+    let max_dim = p.width.max(p.height).max(1.0);
+    // If face jumped across the frame (different person or sudden re-entry), snap immediately.
+    if (r_cx - p_cx).abs() > max_dim * 0.6 || (r_cy - p_cy).abs() > max_dim * 0.6 {
+        return raw;
+    }
+
+    let deadband = 1.5_f32;
+    let alpha = 0.35_f32;
+    let smooth_axis = |prev_val: f32, raw_val: f32| -> f32 {
+        if (raw_val - prev_val).abs() < deadband {
+            prev_val
+        } else {
+            alpha * raw_val + (1.0 - alpha) * prev_val
+        }
+    };
+
+    let cx = smooth_axis(p_cx, r_cx);
+    let cy = smooth_axis(p_cy, r_cy);
+    let w = smooth_axis(p.width, raw.width).max(1.0);
+    let h = smooth_axis(p.height, raw.height).max(1.0);
+
+    FaceBox {
+        x: (cx - w * 0.5).max(0.0),
+        y: (cy - h * 0.5).max(0.0),
+        width: w,
+        height: h,
+        confidence: raw.confidence,
     }
 }
 
@@ -285,7 +366,7 @@ impl YuNetDetector {
     /// Detects the highest-confidence primary face in `frame`, returning `None` if no
     /// face passes `conf_threshold` (e.g. user stepped away from desk).
     pub fn detect_primary_face(&mut self, frame: &RgbImage) -> Result<Option<FaceBox>, String> {
-        fill_bgr_nchw_tensor(
+        let inv_scale = fill_bgr_letterbox_tensor(
             frame,
             &mut self.input_tensor,
             self.input_w as u32,
@@ -299,8 +380,8 @@ impl YuNetDetector {
             .run(ort::inputs![self.input_name.as_str() => input_ref])
             .map_err(|e| format!("YuNet inference failed: {e}"))?;
 
-        let scale_x = frame.width() as f32 / self.input_w as f32;
-        let scale_y = frame.height() as f32 / self.input_h as f32;
+        let frame_w = frame.width() as f32;
+        let frame_h = frame.height() as f32;
 
         let mut best_face: Option<(f32, FaceBox)> = None;
 
@@ -353,16 +434,21 @@ impl YuNetDetector {
                 let w = bbox_slice[base + 2].exp() * stride_f;
                 let h = bbox_slice[base + 3].exp() * stride_f;
 
+                let x1 = ((cx - w * 0.5) * inv_scale).clamp(0.0, (frame_w - 1.0).max(0.0));
+                let y1 = ((cy - h * 0.5) * inv_scale).clamp(0.0, (frame_h - 1.0).max(0.0));
+                let bw = (w * inv_scale).clamp(1.0, (frame_w - x1).max(1.0));
+                let bh = (h * inv_scale).clamp(1.0, (frame_h - y1).max(1.0));
+
                 let face = FaceBox {
-                    x: ((cx - w * 0.5) * scale_x).max(0.0),
-                    y: ((cy - h * 0.5) * scale_y).max(0.0),
-                    width: (w * scale_x).max(1.0),
-                    height: (h * scale_y).max(1.0),
+                    x: x1,
+                    y: y1,
+                    width: bw,
+                    height: bh,
                     confidence: score,
                 };
 
-                // Rank by confidence * sqrt(area) so the primary foreground user beats small background faces.
-                let rank_score = score * (face.width * face.height).sqrt();
+                // Weight confidence squared so high-certainty centered cells beat noisy oversized edge cells.
+                let rank_score = score * score * (face.width * face.height).sqrt();
                 if best_face.is_none_or(|(best_rank, _)| rank_score > best_rank) {
                     best_face = Some((rank_score, face));
                 }
@@ -438,11 +524,12 @@ impl FSANetEstimator {
 
 impl HeadPoseEstimator for FSANetEstimator {
     fn estimate(&mut self, face_crop: &RgbImage) -> Result<HeadPose, String> {
-        fill_bgr_nchw_tensor(
+        fill_bgr_nchw_scaled(
             face_crop,
             &mut self.input_tensor,
             self.input_w as u32,
             self.input_h as u32,
+            1.0 / 255.0,
         );
 
         let input_ref = TensorRef::from_array_view(self.input_tensor.view())
@@ -854,6 +941,7 @@ fn run_vision_loop(
     let mut last_frame_at = Instant::now();
     let mut smoothed_fps = 0.0_f32;
     let mut last_observed_fg_hwnd: usize = 0;
+    let mut stabilized_face: Option<FaceBox> = None;
 
     loop {
         let loop_start = Instant::now();
@@ -870,6 +958,7 @@ fn run_vision_loop(
 
         if !is_enabled || cam_status.is_yielded || fullscreen_blocked {
             engine.process_no_face();
+            stabilized_face = None;
             if let Ok(mut tel) = telemetry.lock() {
                 tel.running = false;
                 tel.measured_fps = 0.0;
@@ -900,8 +989,10 @@ fn run_vision_loop(
                 }
 
                 match det.detect_primary_face(&rgb_frame) {
-                    Ok(Some(face)) => {
-                        let crop = crop_face_with_padding(&rgb_frame, &face, 0.25);
+                    Ok(Some(raw_face)) => {
+                        let face = stabilize_face_box(stabilized_face, raw_face);
+                        stabilized_face = Some(face);
+                        let crop = crop_face_with_padding(&rgb_frame, &face, 0.30);
                         match pose_est.estimate(&crop) {
                             Ok(raw_pose) => {
                                 let now = Instant::now();
@@ -974,6 +1065,7 @@ fn run_vision_loop(
                     }
                     Ok(None) => {
                         engine.process_no_face();
+                        stabilized_face = None;
                         if let Ok(mut tel) = telemetry.lock() {
                             tel.running = true;
                             tel.face_detected = false;
@@ -1059,6 +1151,100 @@ mod tests {
             avg_ms < 66.6,
             "Release pipeline ({avg_ms:.2} ms/frame) exceeded 15 FPS budget (66.6 ms)"
         );
+    }
+
+    #[test]
+    fn test_letterbox_preserves_aspect_and_crop_stabilizer_dampens_jitter() {
+        let frame = RgbImage::from_pixel(640, 480, image::Rgb([100, 150, 200]));
+        let mut tensor = Array4::<f32>::ones((1, 3, 640, 640));
+        let inv_scale = fill_bgr_letterbox_tensor(&frame, &mut tensor, 640, 640);
+
+        // Native 640x480 inside 640x640 uses 1:1 pixels in top 480 rows and 0-pads bottom rows.
+        assert!((inv_scale - 1.0).abs() < 1e-6);
+        assert_eq!(tensor[[0, 0, 0, 0]], 200.0); // B
+        assert_eq!(tensor[[0, 1, 0, 0]], 150.0); // G
+        assert_eq!(tensor[[0, 2, 0, 0]], 100.0); // R
+        assert_eq!(tensor[[0, 0, 500, 0]], 0.0); // zero-padded bottom region
+
+        let base = FaceBox {
+            x: 200.0,
+            y: 120.0,
+            width: 160.0,
+            height: 180.0,
+            confidence: 0.95,
+        };
+        let micro_jitter = FaceBox {
+            x: 200.8,
+            y: 119.3,
+            width: 160.5,
+            height: 179.4,
+            confidence: 0.94,
+        };
+        // Sub-deadband jitter (< 1.5 px) leaves coordinates locked for steady FSANet crops.
+        let frozen = stabilize_face_box(Some(base), micro_jitter);
+        assert_eq!(frozen.x, base.x);
+        assert_eq!(frozen.y, base.y);
+        assert_eq!(frozen.width, base.width);
+
+        // Real head movement (> 1.5 px) tracks smoothly without instant snaps.
+        let moved = FaceBox {
+            x: 224.0,
+            y: 120.0,
+            width: 160.0,
+            height: 180.0,
+            confidence: 0.95,
+        };
+        let tracked = stabilize_face_box(Some(base), moved);
+        assert!(tracked.x > base.x && tracked.x < moved.x);
+    }
+
+    #[test]
+    fn test_fsanet_unit_normalized_stability_and_symmetry() {
+        let fsanet_path = resolve_model_path("head_pose.onnx", None)
+            .expect("head_pose.onnx should exist");
+        let mut estimator = FSANetEstimator::load(&fsanet_path).expect("FSANet should load");
+
+        let build_face = |dx: i32, noise: i32| -> RgbImage {
+            let mut img = RgbImage::from_pixel(64, 64, image::Rgb([35, 38, 42]));
+            for y in 0..64_i32 {
+                for x in 0..64_i32 {
+                    let fx = (x - (32 + dx)) as f32 / 14.0;
+                    let fy = (y - 32) as f32 / 18.0;
+                    if fx * fx + fy * fy <= 1.0 {
+                        let r = (210 + noise).clamp(0, 255) as u8;
+                        let g = (172 + noise).clamp(0, 255) as u8;
+                        let b = (148 + noise).clamp(0, 255) as u8;
+                        img.put_pixel(x as u32, y as u32, image::Rgb([r, g, b]));
+                    }
+                    for ex in [32 + dx - 6, 32 + dx + 6] {
+                        if (x - ex).abs() <= 2 && (y - 28).abs() <= 1 {
+                            img.put_pixel(x as u32, y as u32, image::Rgb([30, 28, 28]));
+                        }
+                    }
+                    if (x - (32 + dx)).abs() <= 1 && (y - 34).abs() <= 3 {
+                        img.put_pixel(x as u32, y as u32, image::Rgb([175, 130, 110]));
+                    }
+                    if (x - (32 + dx)).abs() <= 5 && (y - 40).abs() <= 1 {
+                        img.put_pixel(x as u32, y as u32, image::Rgb([145, 75, 70]));
+                    }
+                }
+            }
+            img
+        };
+
+        let center = estimator.estimate(&build_face(0, 0)).unwrap();
+        let center_noisy = estimator.estimate(&build_face(0, 4)).unwrap();
+        let left = estimator.estimate(&build_face(-6, 0)).unwrap();
+        let right = estimator.estimate(&build_face(6, 0)).unwrap();
+
+        // Centered face must sit near 0 deg yaw, not +17 deg saturation bias.
+        assert!(center.yaw.abs() < 3.0, "Expected centered yaw ~ 0, got {}", center.yaw);
+        assert!(
+            (center.yaw - center_noisy.yaw).abs() < 1.0,
+            "Expected low noise sensitivity, delta={}",
+            (center.yaw - center_noisy.yaw).abs()
+        );
+        assert!(left.yaw < -5.0 && right.yaw > 5.0);
     }
 
     #[test]
