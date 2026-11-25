@@ -31,6 +31,12 @@ export interface MonitorInfo {
   enabled: boolean;
   calibrated: boolean;
   currentFocus: boolean;
+  activeWindowTitle?: string | null;
+  anchor?: {
+    yaw: number;
+    pitch: number;
+    roll: number;
+  } | null;
   osRect: Rect;
   deskPos: DeskPosition;
 }
