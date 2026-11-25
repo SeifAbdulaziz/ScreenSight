@@ -3,6 +3,8 @@
 **ScreenSight** is a local, privacy-first Windows utility that lives in the System Tray and automatically shifts OS window and keyboard focus to whichever display you are looking at—across 2-, 3-, or $N$-monitor horizontal, portrait, ultrawide, and vertically stacked ($2 \times 2$ / $1$-over-$2$) setups.
 
 > Built with **Rust**, **Tauri 2**, **Win32 API (`windows`)**, **Media Foundation (`nokhwa`)**, **ONNX Runtime (`ort`)**, **React**, **TypeScript**, **Tailwind CSS v4**, and **shadcn/ui**.
+>
+> **Platform Support:** **Windows 10 / 11 (x64) only** — Linux and macOS are not currently supported (display discovery, focus switching, fullscreen checks, and webcam auto-yield rely on native Win32, Windows Media Foundation, and Windows Registry APIs).
 
 ---
 
